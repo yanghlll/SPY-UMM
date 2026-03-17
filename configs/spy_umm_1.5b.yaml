@@ -1,0 +1,114 @@
+wandb:
+  entity: null
+  resume: 'auto'
+
+experiment:
+  project: "spy-umm"
+  name: "spy-umm-1.5b-interactive"
+  output_dir: "output/spy-umm-1.5b-interactive"
+  save_every: 500
+  generate_every: 200
+  log_every: 10
+  log_grad_norm_every: 100
+  resume_from_checkpoint: False
+
+model:
+  vae_model:
+    type: "wan21"
+    pretrained_model_path: "/nfs-stor/haolin.yang/models/Wan2.1_VAE.pth"
+  weight_type: "bfloat16"
+
+  showo:
+    model_name: "Showo2"
+    load_from_showo: True
+    pretrained_model_path: "showlab/show-o2-1.5B"
+    llm_model_path: "Qwen/Qwen2.5-1.5B-Instruct"
+    llm_vocab_size: null
+    hidden_size: 1536
+    image_latent_dim: 16
+    image_latent_height: 27
+    image_latent_width: 27
+    patch_size: 2
+    num_diffusion_layers: 10
+    clip_latent_dim: 1152
+    add_qk_norm: True
+    add_time_embeds: True
+    frozen_params: ['und_trans', 'image_embedder_und', 'position_embedding']
+    params_not_load: null
+
+  gradient_checkpointing: True
+
+game:
+  num_players: 4
+  num_objects_min: 3
+  num_objects_max: 6
+  num_objects_to_modify: 2
+  epoch_size: 500
+
+dataset:
+  vision_zero_images_dir: "/nfs-stor/haolin.yang/Data/Vision-Zero/clevr-dataset/output/replacement_images"
+  preprocessing:
+    max_seq_length: 1024
+    resolution: 432
+    num_t2i_image_tokens: 729
+    num_mmu_image_tokens: 729
+    latent_height: ${model.showo.image_latent_height}
+    latent_width: ${model.showo.image_latent_width}
+
+training:
+  phase_mode: "interactive"   # 'generation', 'voting', 'both', 'interactive'
+  cycle_length: 10            # steps per phase in interactive mode
+  gen_loss_coeff: 1.0
+  vote_loss_coeff: 1.0
+  ntp_coeff: 0.2
+  flow_coeff: 1.0
+  num_generations: 4          # G for GRPO in voting phase
+  beta: 0.0                   # KL penalty
+  epsilon: 0.2                # PPO clip
+  gradient_accumulation_steps: 4
+  batch_size: 1               # games per batch
+  mixed_precision: "bf16"
+  enable_tf32: True
+  max_grad_norm: 1.0
+  max_train_steps: 10000
+  seed: 42
+  cond_dropout_prob: 0.1
+  # Reward-weighted flow matching params
+  reward_baseline_ema: 0.9
+  reward_clamp_min: 0.0
+  # Voting params
+  max_vote_tokens: 512
+  vote_temperature: 1.0
+
+optimizer:
+  name: adamw
+  params:
+    learning_rate_ve: 0.00001
+    learning_rate_proj: 0.00005
+    learning_rate_showo: 0.00005
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0
+    epsilon: 1e-8
+
+lr_scheduler:
+  scheduler: "cosine"
+  params:
+    warmup_steps: null
+    warmup_ratio: 0.05
+
+transport:
+  path_type: "Linear"
+  prediction: "velocity"
+  loss_weight: null
+  train_eps: null
+  sample_eps: null
+  snr_type: "lognorm"
+  sampling_method: "euler"
+  guidance_scale: 5.0
+  num_inference_steps: 50
+  atol: 1e-6
+  rtol: 1e-3
+  reverse: False
+  do_shift: True
+  time_shifting_factor: 3.0

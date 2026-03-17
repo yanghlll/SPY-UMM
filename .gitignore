@@ -1,0 +1,30 @@
+# Output and checkpoints
+output/
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Symlinks to external code
+transport
+
+# System
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Wandb
+wandb/
+
+# IDE
+.vscode/
+.idea/
