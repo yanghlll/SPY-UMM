@@ -12,9 +12,9 @@ export OMP_NUM_THREADS=8
 export TOKENIZERS_PARALLELISM=true
 
 # Add Show-o2 to PYTHONPATH
-export PYTHONPATH="/nfs-stor/haolin.yang/Code/UMM/Show-o/show-o2:${PYTHONPATH}"
+export PYTHONPATH="/adialab/usr/shadabk/MedUMM/Show-o/show-o2:${PYTHONPATH}"
 
-cd /nfs-stor/haolin.yang/Code/UMM/SPY-UMM
+cd /adialab/usr/shadabk/MedUMM/SPY-UMM
 
 # Default config: Flow-GRPO (full)
 # Change to spy_umm_1.5b_flow_grpo_fast.yaml for Fast mode

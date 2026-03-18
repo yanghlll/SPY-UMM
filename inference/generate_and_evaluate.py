@@ -24,16 +24,30 @@ SHOWO2_DIR = os.path.normpath(SHOWO2_DIR)
 if SHOWO2_DIR not in sys.path:
     sys.path.insert(0, SHOWO2_DIR)
 
+# --- Show-o2 imports (must come first) ---
 from models import Showo2Qwen2_5, omni_attn_mask_naive
 from models.misc import get_text_tokenizer, get_weight_type
 from utils import get_config, denorm, path_to_llm_name, load_state_dict
 from transport import Sampler, create_transport
 
-# SPY-UMM imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+# --- Swap module cache: remove Show-o2's 'models' so SPY-UMM's can load ---
+_showo2_models_cache = {k: sys.modules[k] for k in list(sys.modules.keys())
+                        if k == 'models' or k.startswith('models.')}
+for k in _showo2_models_cache:
+    del sys.modules[k]
+if SHOWO2_DIR in sys.path:
+    sys.path.remove(SHOWO2_DIR)
+
+# --- SPY-UMM imports ---
+SPY_UMM_DIR = os.path.join(os.path.dirname(__file__), '..')
+if SPY_UMM_DIR not in sys.path:
+    sys.path.insert(0, os.path.normpath(SPY_UMM_DIR))
 from data import SpyGameDataGenerator
 from models.showo2_spy_wrapper import Showo2SpyWrapper
 from training.rewards import vote_accuracy_reward, vote_format_reward
+
+# Restore Show-o2's models in module cache
+sys.modules.update(_showo2_models_cache)
 
 
 def main():

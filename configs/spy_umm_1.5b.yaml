@@ -15,7 +15,7 @@ experiment:
 model:
   vae_model:
     type: "wan21"
-    pretrained_model_path: "/nfs-stor/haolin.yang/models/Wan2.1_VAE.pth"
+    pretrained_model_path: "/adialab/usr/shadabk/MedUMM/models/Wan2.1_VAE.pth"
   weight_type: "bfloat16"
 
   showo:
@@ -36,7 +36,7 @@ model:
     frozen_params: ['und_trans', 'image_embedder_und', 'position_embedding']
     params_not_load: null
 
-  gradient_checkpointing: True
+  gradient_checkpointing: False
 
 game:
   num_players: 4
@@ -46,12 +46,14 @@ game:
   epoch_size: 500
 
 dataset:
-  vision_zero_images_dir: "/nfs-stor/haolin.yang/Data/Vision-Zero/clevr-dataset/output/replacement_images"
+  vision_zero_images_dir: "/adialab/usr/shadabk/MedUMM/data/Vision-Zero/clevr-dataset/output/replacement_images"
   preprocessing:
     max_seq_length: 1024
     resolution: 432
     num_t2i_image_tokens: 729
     num_mmu_image_tokens: 729
+    num_video_tokens: 0
+    num_mixed_modal_tokens: 0
     latent_height: ${model.showo.image_latent_height}
     latent_width: ${model.showo.image_latent_width}
 

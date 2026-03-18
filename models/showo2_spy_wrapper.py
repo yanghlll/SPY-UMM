@@ -16,8 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Callable, List, Dict, Any, Optional, Tuple
 from PIL import Image
-from einops import rearrange
-import numpy as np
 
 
 class Showo2SpyWrapper(nn.Module):
@@ -237,30 +235,31 @@ class Showo2SpyWrapper(nn.Module):
         for i in range(B):
             # transport.sample returns (t, x0_noise, x1_data)
             t_i, x0_i, x1_i = self.transport.sample(target_latents[i:i + 1])
+            # Move t to correct device (transport creates t on CPU)
+            t_i = t_i.to(device)
             # path_sampler.plan returns (t, xt_noised, ut_velocity_target)
             t_plan, xt_i, ut_i = self.transport.path_sampler.plan(t_i, x0_i, x1_i)
-            t_list.append(t_plan)
-            xt_list.append(xt_i)
-            ut_list.append(ut_i)
+            t_list.append(t_plan.to(device))
+            xt_list.append(xt_i.to(device))
+            ut_list.append(ut_i.to(device))
 
         t = torch.stack(t_list, dim=0).squeeze(-1)  # [B]
         xt = torch.cat(xt_list, dim=0)   # [B, C, H, W]
         ut = torch.cat(ut_list, dim=0)   # [B, C, H, W]
-
-        # Prepare image_labels: patchify target velocity (ut)
-        # Matches modeling_showo2_qwen2_5.py forward() lines 328-337
-        # For T=0 (images): (B, C, H, W) -> (B, h_*w_, p*p*C)
-        image_labels = rearrange(ut, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',
-                                 p1=p, p2=p, h=h_, w=w_).to(dtype)
 
         # Create attention mask
         block_mask = omni_attn_mask_naive(
             B, self.max_seq_len, batch_mod_pos, device
         ).to(dtype)
 
-        # Create image masks (all ones for generation tokens)
-        # Shape: [B, num_t2i_tokens]
-        image_masks = torch.ones(B, self.num_t2i_tokens, device=device)
+        # Create image masks: must be [B, max_seq_len] (full sequence length).
+        # Model internally expands to [B, max_seq_len, p*p*c] and masks
+        # the time embed position. We set 1s at image token positions.
+        image_masks = torch.zeros(B, self.max_seq_len, device=device)
+        for i, mod_pos in enumerate(batch_mod_pos):
+            for offset, length in mod_pos:
+                if length > 0:
+                    image_masks[i, offset:offset + length] = 1
 
         # Forward pass through model
         # The model.forward() with text_labels=None, image_labels=not None
@@ -274,7 +273,7 @@ class Showo2SpyWrapper(nn.Module):
             text_masks=torch.ones_like(batch_text_tokens, dtype=torch.bool),
             image_masks=image_masks,
             text_labels=None,   # No NTP loss in generation phase
-            image_labels=target_latents.to(dtype),  # model will patchify this internally
+            image_labels=ut.to(dtype),  # velocity target, model will patchify internally
             modality_positions=batch_mod_pos,
             output_hidden_states=True,
             max_seq_len=self.max_seq_len,
@@ -621,7 +620,13 @@ class Showo2SpyWrapper(nn.Module):
             B, self.max_seq_len, batch_mod_pos, device
         ).to(dtype)
 
-        image_masks = torch.ones(B, self.num_t2i_tokens, device=device)
+        # image_masks must be [B, max_seq_len] with 1s at image token positions,
+        # matching compute_flow_loss() and the model's expected input shape.
+        image_masks = torch.zeros(B, self.max_seq_len, device=device)
+        for i, mod_pos in enumerate(batch_mod_pos):
+            for offset, length in mod_pos:
+                if length > 0:
+                    image_masks[i, offset:offset + length] = 1
 
         velocity_fn_kwargs = dict(
             text_tokens=batch_text_tokens,

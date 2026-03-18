@@ -28,11 +28,12 @@ from accelerate.logging import get_logger
 from accelerate.utils import DistributedType, set_seed
 
 # Add Show-o2 to path for model imports
-SHOWO2_DIR = os.path.join(os.path.dirname(__file__), '..', 'Show-o', 'show-o2')
-SHOWO2_DIR = os.path.normpath(SHOWO2_DIR)
-if SHOWO2_DIR not in sys.path:
-    sys.path.insert(0, SHOWO2_DIR)
+SHOWO2_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Show-o', 'show-o2'))
+# Remove any existing Show-o2 entries (e.g. from PYTHONPATH) to avoid duplicates
+sys.path = [p for p in sys.path if os.path.abspath(p) != SHOWO2_DIR]
+sys.path.insert(0, SHOWO2_DIR)
 
+# --- Show-o2 imports (must come first, before SPY-UMM's models package) ---
 from models import Showo2Qwen2_5, omni_attn_mask_naive
 from models.lr_schedulers import get_scheduler
 from models.my_logging import set_verbosity_info, set_verbosity_error
@@ -41,7 +42,15 @@ from utils import (get_config, flatten_omega_conf, AverageMeter, denorm,
                    path_to_llm_name, _freeze_params, save_images_as_grid)
 from transport import Sampler, create_transport
 
-# SPY-UMM imports
+# --- Swap module cache: remove Show-o2's 'models' so SPY-UMM's can load ---
+_showo2_models_cache = {k: sys.modules[k] for k in list(sys.modules.keys())
+                        if k == 'models' or k.startswith('models.')}
+for k in _showo2_models_cache:
+    del sys.modules[k]
+if SHOWO2_DIR in sys.path:
+    sys.path.remove(SHOWO2_DIR)
+
+# --- SPY-UMM imports (now 'models' resolves to SPY-UMM/models) ---
 from data import SpyGameDataGenerator, VisionZeroDataAdapter
 from models.showo2_spy_wrapper import Showo2SpyWrapper
 from training.phase_controller import PhaseController
@@ -49,6 +58,9 @@ from training.reward_weighted_flow import RewardWeightedFlowMatchingLoss
 from training.grpo_voting import VotingGRPO, generate_and_score_votes
 from training.rewards import vote_accuracy_reward, vote_format_reward
 from training.flow_grpo import FlowGRPO, FlowGRPOConfig
+
+# Restore Show-o2's models in module cache (so already-imported refs stay valid)
+sys.modules.update(_showo2_models_cache)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
@@ -331,7 +343,7 @@ def main():
     # Vision-Zero data adapter
     vz_images_dir = config.dataset.get(
         "vision_zero_images_dir",
-        "/nfs-stor/haolin.yang/Data/Vision-Zero/clevr-dataset/output/replacement_images"
+        "/adialab/usr/shadabk/MedUMM/data/Vision-Zero/clevr-dataset/output/replacement_images"
     )
     vz_adapter = None
     if os.path.isdir(vz_images_dir):
@@ -385,6 +397,9 @@ def main():
     # ACCELERATOR PREPARE   #
     #########################
     model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+
+    # Update spy_wrapper to use the unwrapped model on the correct device
+    spy_wrapper.model = accelerator.unwrap_model(model)
 
     #########################
     # TRAINING LOOP         #
