@@ -101,10 +101,10 @@ training:
   # Paper: T=10 gives 4x speedup vs T=40 with negligible reward loss
   flow_grpo_train_steps: 10
 
-  # Flow-GRPO-Fast: train on only 1-2 SDE steps per trajectory (5-10x speedup)
-  flow_grpo_fast_mode: False    # Set True for faster training
-  sde_window_size: 2            # Number of SDE steps to use in fast mode
-  sde_window_range: [0.1, 0.9] # Timestep range for fast mode step selection
+  # SDE window: contiguous window of SDE steps within the hybrid ODE/SDE trajectory
+  # (like Bagel: most steps are ODE, only sde_window_size steps are stochastic SDE)
+  sde_window_size: 2            # Number of contiguous SDE steps
+  sde_window_range: [0, 5]      # [lo, hi] step index range for window start
 
 optimizer:
   name: adamw

@@ -180,7 +180,6 @@ def main():
     _freeze_params(model, config.model.showo.frozen_params)
 
     # Time embedding adjustment
-    # mmu和t2i都要加吗？
     if config.model.showo.add_time_embeds:
         config.dataset.preprocessing.num_mmu_image_tokens += 1
         config.dataset.preprocessing.num_t2i_image_tokens += 1
@@ -317,9 +316,8 @@ def main():
         beta=config.training.get("flow_grpo_beta", 0.01),
         num_train_steps=config.training.get("flow_grpo_train_steps", 10),
         num_inference_steps=config.transport.num_inference_steps,
-        fast_mode=config.training.get("flow_grpo_fast_mode", False),
         sde_window_size=config.training.get("sde_window_size", 2),
-        sde_window_range=tuple(config.training.get("sde_window_range", [0.1, 0.9])),
+        sde_window_range=tuple(config.training.get("sde_window_range", [0, 5])),
         do_shift=config.transport.do_shift,
         time_shifting_factor=config.transport.time_shifting_factor,
     )
@@ -328,7 +326,7 @@ def main():
     if use_flow_grpo:
         logger.info(f"Flow-GRPO enabled: group_size={flow_grpo_config.group_size}, "
                     f"train_steps={flow_grpo_config.num_train_steps}, "
-                    f"fast_mode={flow_grpo_config.fast_mode}")
+                    f"sde_window_size={flow_grpo_config.sde_window_size}")
 
     # Reference model for KL penalty (frozen copy)
     ref_model = None
@@ -442,274 +440,260 @@ def main():
             gen_loss = torch.tensor(0.0, device=accelerator.device)
             vote_loss = torch.tensor(0.0, device=accelerator.device)
             player_votes = [None] * num_players
-            flow_grpo_metrics = {}  # Initialize for logging scope
+            flow_grpo_metrics = {}
 
             # =========================================
-            # Step C: Generate images (no_grad)
+            # Step C: Generate prompts
             # =========================================
             prompts = [
                 game_generator.format_generation_prompt_simple(game_data, pid)
                 for pid in range(1, num_players + 1)
             ]
 
-            with torch.no_grad():
-                gen_result = spy_wrapper.generate_images(
-                    prompts,
-                    guidance_scale=config.transport.guidance_scale,
-                    num_steps=config.transport.num_inference_steps,
-                )
-                generated_latents = gen_result['latents']  # [num_players, C, H, W]
+            if use_flow_grpo and train_gen:
+                # =========================================
+                # Flow-GRPO path: SDE images participate in real games
+                # (Bagel-style: each generated image gets its own reward)
+                # =========================================
+                G = flow_grpo_config.group_size
+                T_train = flow_grpo_config.num_train_steps
 
-            # =========================================
-            # Step D-F: Voting phase (GRPO)
-            # =========================================
-            if train_vote:
-                voting_prompt = game_generator.format_voting_prompt(game_data)
+                # Phase 1: Generate G full games via SDE (no_grad)
+                # Each game has num_players SDE images that go through voting
+                all_game_trajectories = []  # [G][num_players] trajectory dicts
+                all_game_rewards = []       # [G] list of per-player reward lists
+                all_game_vfn_kwargs = []    # [G][num_players] vfn_kwargs
 
-                # D: Generate G vote completions and score them
-                vote_result = generate_and_score_votes(
-                    spy_wrapper,
-                    [generated_latents[i:i+1] for i in range(num_players)],
-                    voting_prompt,
-                    correct_spy=game_data['spy_player'],
-                    num_generations=config.training.num_generations,
-                    max_tokens=config.training.max_vote_tokens,
-                    temperature=config.training.vote_temperature,
-                )
+                for g in range(G):
+                    game_trajs = {}
+                    game_vfn_kwargs = {}
+                    game_latents = []
 
-                # Extract votes for game reward calculation
-                for resp in vote_result['responses']:
-                    vote_info = game_generator.extract_vote(resp)
-                    player_votes.append(vote_info)
-                # Only keep first num_players votes for game outcome
-                player_votes = player_votes[:num_players]
-
-                # E: Compute old log probs (no_grad) and current log probs (with grad)
-                advantages = voting_grpo.compute_advantages(
-                    vote_result['total_rewards']
-                )
-
-                old_logprobs_list = []
-                current_logprobs_list = []
-                completion_ids_list = []
-                completion_masks_list = []
-
-                for resp in vote_result['responses']:
-                    comp_ids = text_tokenizer(
-                        resp, add_special_tokens=False, return_tensors='pt'
-                    )['input_ids'].to(accelerator.device)
-
-                    # Truncate if too long
-                    if comp_ids.shape[1] > config.training.max_vote_tokens:
-                        comp_ids = comp_ids[:, :config.training.max_vote_tokens]
-
-                    completion_ids_list.append(comp_ids)
-                    completion_masks_list.append(
-                        torch.ones_like(comp_ids, dtype=torch.float)
-                    )
-
-                    # Old log probs (no gradient)
                     with torch.no_grad():
-                        old_lp = spy_wrapper.compute_voting_logprobs(
-                            generated_latents[0:1],
-                            voting_prompt,
-                            comp_ids,
+                        # Generate all players' images via SDE
+                        for pid in range(num_players):
+                            inputs = spy_wrapper.prepare_flow_grpo_inputs(
+                                [prompts[pid]], guidance_scale=0.0
+                            )
+                            vfn_kwargs = inputs['velocity_fn_kwargs']
+                            velocity_fn = spy_wrapper.make_velocity_fn(**vfn_kwargs)
+
+                            traj = flow_grpo.generate_trajectory(
+                                velocity_fn, inputs['z_init'],
+                                num_steps=T_train,
+                            )
+
+                            game_trajs[pid] = traj
+                            game_vfn_kwargs[pid] = vfn_kwargs
+                            game_latents.append(traj['final'])
+
+                        # Decode SDE images and run a real voting game
+                        sde_latents = torch.cat(game_latents, dim=0)  # [N,C,H,W]
+                        voting_prompt = game_generator.format_voting_prompt(game_data)
+
+                        game_votes = []
+                        for pid in range(num_players):
+                            vote_resp = spy_wrapper.judge_vote(
+                                [sde_latents[pid:pid+1]],
+                                voting_prompt,
+                            )
+                            vote_info = game_generator.extract_vote(vote_resp)
+                            game_votes.append(vote_info)
+
+                        # Real rewards from this SDE game
+                        game_outcome = game_generator.calculate_game_rewards(
+                            game_data, game_votes
                         )
-                    old_logprobs_list.append(old_lp)
+                        gen_rewards_g = game_generator.compute_generation_rewards(
+                            game_outcome
+                        )
 
-                # F: Compute current log probs (with gradient)
-                for comp_ids in completion_ids_list:
-                    cur_lp = spy_wrapper.compute_voting_logprobs(
-                        generated_latents[0:1],
+                        if game_outcome['spy_caught']:
+                            spy_caught_count += 1
+                        total_games_played += 1
+
+                    all_game_trajectories.append(game_trajs)
+                    all_game_rewards.append(gen_rewards_g)
+                    all_game_vfn_kwargs.append(game_vfn_kwargs)
+
+                # Phase 2: Compute group-relative advantages
+                # Flatten: [G * num_players] rewards
+                flat_rewards = []
+                for gen_rewards_g in all_game_rewards:
+                    flat_rewards.extend(gen_rewards_g)
+                logger.info(f"  Flow-GRPO rewards: {flat_rewards}")
+                all_advantages = FlowGRPO.compute_advantages(
+                    torch.tensor(flat_rewards, dtype=torch.float32,
+                                 device=accelerator.device)
+                )
+
+                # Phase 3: Per-timestep backward (like Bagel)
+                # For each trajectory's SDE window steps, compute GRPO loss
+                # and do backward individually for memory efficiency.
+                adv_idx = 0
+                grpo_metrics_accum = []
+                num_sde_steps_total = 0
+
+                for g in range(G):
+                    for pid in range(num_players):
+                        traj = all_game_trajectories[g][pid]
+                        vfn_kwargs = all_game_vfn_kwargs[g][pid]
+                        advantage = all_advantages[adv_idx]
+                        adv_idx += 1
+
+                        velocity_fn = spy_wrapper.make_velocity_fn(**vfn_kwargs)
+
+                        # Reference model velocity fn for KL
+                        ref_vel_fn = None
+                        if ref_model is not None and flow_grpo_config.beta > 0:
+                            orig_model = spy_wrapper.model
+                            spy_wrapper.model = ref_model
+                            ref_vel_fn = spy_wrapper.make_velocity_fn(**vfn_kwargs)
+                            spy_wrapper.model = orig_model
+
+                        # Per-timestep backward on SDE window steps
+                        for sde_step_data in traj['sde_steps']:
+                            step_result = flow_grpo.compute_per_step_loss(
+                                velocity_fn, sde_step_data,
+                                advantage.unsqueeze(0),  # [1]
+                                ref_model_fn=ref_vel_fn,
+                            )
+
+                            step_loss = step_result['loss'] * config.training.gen_loss_coeff
+                            accelerator.backward(
+                                step_loss / config.training.gradient_accumulation_steps
+                            )
+                            grpo_metrics_accum.append(step_result['metrics'])
+                            num_sde_steps_total += 1
+
+                # Aggregate metrics
+                if grpo_metrics_accum:
+                    flow_grpo_metrics = {
+                        k: sum(m[k] for m in grpo_metrics_accum) / len(grpo_metrics_accum)
+                        for k in grpo_metrics_accum[0]
+                    }
+                    flow_grpo_metrics['mean_reward'] = sum(flat_rewards) / len(flat_rewards)
+                    flow_grpo_metrics['num_sde_steps'] = num_sde_steps_total
+
+                # gen_loss already backward'd per-step; set to 0 to avoid double backward
+                gen_loss = torch.tensor(0.0, device=accelerator.device)
+
+                # Use first game's latents for sample visualization
+                generated_latents = torch.cat(
+                    [all_game_trajectories[0][pid]['final']
+                     for pid in range(num_players)], dim=0
+                )
+
+            else:
+                # =========================================
+                # Non-Flow-GRPO path: ODE generation + voting + RW-Flow
+                # =========================================
+                with torch.no_grad():
+                    gen_result = spy_wrapper.generate_images(
+                        prompts,
+                        guidance_scale=config.transport.guidance_scale,
+                        num_steps=config.transport.num_inference_steps,
+                    )
+                    generated_latents = gen_result['latents']
+
+                # Voting phase (GRPO on text)
+                if train_vote:
+                    voting_prompt = game_generator.format_voting_prompt(game_data)
+
+                    vote_result = generate_and_score_votes(
+                        spy_wrapper,
+                        [generated_latents[i:i+1] for i in range(num_players)],
                         voting_prompt,
-                        comp_ids,
+                        correct_spy=game_data['spy_player'],
+                        num_generations=config.training.num_generations,
+                        max_tokens=config.training.max_vote_tokens,
+                        temperature=config.training.vote_temperature,
                     )
-                    current_logprobs_list.append(cur_lp)
 
-                # Pad to uniform length and stack
-                max_len = max(c.shape[1] for c in completion_ids_list)
-                padded_current = []
-                padded_old = []
-                padded_masks = []
+                    for resp in vote_result['responses']:
+                        vote_info = game_generator.extract_vote(resp)
+                        player_votes.append(vote_info)
+                    player_votes = player_votes[:num_players]
 
-                for cur_lp, old_lp, mask in zip(
-                    current_logprobs_list, old_logprobs_list, completion_masks_list
-                ):
-                    pad_len = max_len - cur_lp.shape[1]
-                    if pad_len > 0:
-                        cur_lp = F.pad(cur_lp, (0, pad_len), value=0.0)
-                        old_lp = F.pad(old_lp, (0, pad_len), value=0.0)
-                        mask = F.pad(mask, (0, pad_len), value=0.0)
-                    padded_current.append(cur_lp)
-                    padded_old.append(old_lp)
-                    padded_masks.append(mask)
-
-                current_logprobs = torch.cat(padded_current, dim=0)  # [G, L]
-                old_logprobs = torch.cat(padded_old, dim=0)
-                completion_masks = torch.cat(padded_masks, dim=0)
-
-                grpo_result = voting_grpo.compute_loss(
-                    current_logprobs,
-                    old_logprobs,
-                    advantages.to(accelerator.device),
-                    completion_masks,
-                )
-                vote_loss = grpo_result['loss']
-
-            # =========================================
-            # Step G-I: Generation phase training
-            # =========================================
-            if train_gen:
-                # G: Compute game outcome from votes
-                game_outcome = game_generator.calculate_game_rewards(
-                    game_data, player_votes
-                )
-                gen_rewards = game_generator.compute_generation_rewards(game_outcome)
-                reward_tensor = torch.tensor(
-                    gen_rewards, dtype=torch.float32, device=accelerator.device
-                )
-
-                is_spy = torch.zeros(num_players, dtype=torch.bool,
-                                     device=accelerator.device)
-                is_spy[game_data['spy_player'] - 1] = True
-
-                # Track game outcome
-                if game_outcome['spy_caught']:
-                    spy_caught_count += 1
-                total_games_played += 1
-
-                if use_flow_grpo:
-                    # ---- Flow-GRPO: proper policy gradient on flow head ----
-                    # Generate G images per player via SDE, compute advantages
-                    # ACROSS all players (spy vs civilian rewards create variance).
-                    G = flow_grpo_config.group_size
-                    T_train = flow_grpo_config.num_train_steps
-
-                    # Phase 1: Generate all SDE trajectories (no_grad)
-                    all_trajectories = []   # [num_players][G] trajectories
-                    all_old_logprobs = []   # [num_players][G] old log probs
-                    all_vfn_kwargs = []     # [num_players][G] velocity fn kwargs
-                    flat_rewards = []       # [num_players * G] rewards
-
-                    for pid in range(num_players):
-                        prompt = prompts[pid]
-                        player_trajectories = []
-                        player_old_lps = []
-                        player_vfn_kwargs = []
-
-                        for g in range(G):
-                            with torch.no_grad():
-                                sde_result = spy_wrapper.generate_images_sde(
-                                    [prompt], flow_grpo,
-                                    num_steps=T_train,
-                                    guidance_scale=0.0,  # No CFG during training
-                                )
-                                player_trajectories.append(sde_result['trajectory'])
-                                player_vfn_kwargs.append(sde_result['velocity_fn_kwargs'])
-
-                                # Select fast steps if enabled
-                                if flow_grpo_config.fast_mode:
-                                    step_indices = flow_grpo.select_fast_steps(
-                                        T_train, accelerator.device
-                                    )
-                                else:
-                                    step_indices = None
-
-                                # Compute old log probs
-                                old_lp = spy_wrapper.compute_flow_grpo_logprobs(
-                                    flow_grpo,
-                                    sde_result['trajectory'],
-                                    sde_result['velocity_fn_kwargs'],
-                                    step_indices=step_indices,
-                                )
-                                player_old_lps.append(old_lp)
-
-                            # Each generation gets the player's game reward
-                            flat_rewards.append(gen_rewards[pid])
-
-                        all_trajectories.append(player_trajectories)
-                        all_old_logprobs.append(torch.cat(player_old_lps, dim=0))
-                        all_vfn_kwargs.append(player_vfn_kwargs)
-
-                    # Phase 2: Compute group-relative advantages across ALL players
-                    # This gives variance: spy reward != civilian reward
-                    all_rewards_tensor = torch.tensor(
-                        flat_rewards, dtype=torch.float32,
-                        device=accelerator.device,
-                    )  # [num_players * G]
-                    all_advantages = FlowGRPO.compute_advantages(all_rewards_tensor)
-
-                    # Phase 3: Recompute log probs with gradient and GRPO loss
-                    flow_grpo_loss = torch.tensor(0.0, device=accelerator.device)
-
-                    flat_idx = 0
-                    all_current_lps = []
-                    all_old_lps_flat = []
-                    all_kl_flat = []
-
-                    for pid in range(num_players):
-                        for g in range(G):
-                            traj = all_trajectories[pid][g]
-                            vfn_kwargs = all_vfn_kwargs[pid][g]
-
-                            if flow_grpo_config.fast_mode:
-                                step_indices = flow_grpo.select_fast_steps(
-                                    T_train, accelerator.device
-                                )
-                            else:
-                                step_indices = None
-
-                            cur_lp = spy_wrapper.compute_flow_grpo_logprobs(
-                                flow_grpo, traj, vfn_kwargs,
-                                step_indices=step_indices,
-                            )
-                            all_current_lps.append(cur_lp)
-                            all_old_lps_flat.append(
-                                all_old_logprobs[pid][g:g+1]
-                            )
-
-                            # KL penalty with reference model
-                            if ref_model is not None and flow_grpo_config.beta > 0:
-                                # Create ref velocity fn using ref_model
-                                orig_model = spy_wrapper.model
-                                spy_wrapper.model = ref_model
-                                ref_vel_fn = spy_wrapper.make_velocity_fn(**vfn_kwargs)
-                                spy_wrapper.model = orig_model
-
-                                vel_fn = spy_wrapper.make_velocity_fn(**vfn_kwargs)
-                                kl = flow_grpo.compute_trajectory_kl(
-                                    vel_fn, ref_vel_fn, traj,
-                                    step_indices=step_indices,
-                                )
-                                all_kl_flat.append(kl)
-
-                            flat_idx += 1
-
-                    current_logprobs = torch.cat(all_current_lps, dim=0)  # [N*G]
-                    old_logprobs_flat = torch.cat(all_old_lps_flat, dim=0)  # [N*G]
-                    kl_tensor = torch.cat(all_kl_flat, dim=0) if all_kl_flat else None
-
-                    grpo_result = flow_grpo.compute_grpo_loss(
-                        current_logprobs,
-                        old_logprobs_flat.detach(),
-                        all_advantages,
-                        kl_tensor,
+                    advantages = voting_grpo.compute_advantages(
+                        vote_result['total_rewards']
                     )
-                    gen_loss = grpo_result['loss']
-                    flow_grpo_metrics = grpo_result['metrics']
 
-                else:
-                    # ---- Fallback: reward-weighted flow matching ----
-                    # H: Get target latents
+                    old_logprobs_list = []
+                    current_logprobs_list = []
+                    completion_ids_list = []
+                    completion_masks_list = []
+
+                    for resp in vote_result['responses']:
+                        comp_ids = text_tokenizer(
+                            resp, add_special_tokens=False, return_tensors='pt'
+                        )['input_ids'].to(accelerator.device)
+                        if comp_ids.shape[1] > config.training.max_vote_tokens:
+                            comp_ids = comp_ids[:, :config.training.max_vote_tokens]
+                        completion_ids_list.append(comp_ids)
+                        completion_masks_list.append(
+                            torch.ones_like(comp_ids, dtype=torch.float)
+                        )
+                        with torch.no_grad():
+                            old_lp = spy_wrapper.compute_voting_logprobs(
+                                generated_latents[0:1], voting_prompt, comp_ids,
+                            )
+                        old_logprobs_list.append(old_lp)
+
+                    for comp_ids in completion_ids_list:
+                        cur_lp = spy_wrapper.compute_voting_logprobs(
+                            generated_latents[0:1], voting_prompt, comp_ids,
+                        )
+                        current_logprobs_list.append(cur_lp)
+
+                    max_len = max(c.shape[1] for c in completion_ids_list)
+                    padded_current, padded_old, padded_masks = [], [], []
+                    for cur_lp, old_lp, mask in zip(
+                        current_logprobs_list, old_logprobs_list, completion_masks_list
+                    ):
+                        pad_len = max_len - cur_lp.shape[1]
+                        if pad_len > 0:
+                            cur_lp = F.pad(cur_lp, (0, pad_len), value=0.0)
+                            old_lp = F.pad(old_lp, (0, pad_len), value=0.0)
+                            mask = F.pad(mask, (0, pad_len), value=0.0)
+                        padded_current.append(cur_lp)
+                        padded_old.append(old_lp)
+                        padded_masks.append(mask)
+
+                    current_logprobs = torch.cat(padded_current, dim=0)
+                    old_logprobs = torch.cat(padded_old, dim=0)
+                    completion_masks = torch.cat(padded_masks, dim=0)
+
+                    grpo_result = voting_grpo.compute_loss(
+                        current_logprobs, old_logprobs,
+                        advantages.to(accelerator.device), completion_masks,
+                    )
+                    vote_loss = grpo_result['loss']
+
+                # Generation phase (reward-weighted flow matching)
+                if train_gen:
+                    game_outcome = game_generator.calculate_game_rewards(
+                        game_data, player_votes
+                    )
+                    gen_rewards = game_generator.compute_generation_rewards(game_outcome)
+                    reward_tensor = torch.tensor(
+                        gen_rewards, dtype=torch.float32, device=accelerator.device
+                    )
+                    is_spy = torch.zeros(num_players, dtype=torch.bool,
+                                         device=accelerator.device)
+                    is_spy[game_data['spy_player'] - 1] = True
+
+                    if game_outcome['spy_caught']:
+                        spy_caught_count += 1
+                    total_games_played += 1
+
                     if vz_adapter is not None:
                         target_latents = vz_adapter.get_target_latents(
                             game_data, accelerator.device
                         )
                     else:
-                        # Self-play: use generated latents as targets (detached)
                         target_latents = generated_latents.detach()
 
-                    # I: Compute reward-weighted flow matching loss
                     flow_result = spy_wrapper.compute_flow_loss(
                         prompts,
                         target_latents=target_latents,
@@ -722,14 +706,17 @@ def main():
             # =========================================
             # Step J: Combined loss and backward
             # =========================================
+            # Flow-GRPO path already did per-step backward above;
+            # only backward here if there's remaining loss with grad (e.g. vote_loss)
             total_loss = (
                 config.training.gen_loss_coeff * gen_loss +
                 config.training.vote_loss_coeff * vote_loss
             )
 
-            accelerator.backward(
-                total_loss / config.training.gradient_accumulation_steps
-            )
+            if total_loss.requires_grad:
+                accelerator.backward(
+                    total_loss / config.training.gradient_accumulation_steps
+                )
 
             # Gradient clipping and optimizer step
             if config.training.max_grad_norm is not None and accelerator.sync_gradients:
@@ -755,10 +742,16 @@ def main():
                     phase_info = phase_controller.log_phase_info(global_step)
                     spy_rate = (spy_caught_count / max(total_games_played, 1))
 
+                    # For Flow-GRPO, show actual policy loss instead of 0
+                    effective_gen_loss = (
+                        flow_grpo_metrics.get('policy_loss', 0.0)
+                        if use_flow_grpo and train_gen and flow_grpo_metrics
+                        else gen_loss.item()
+                    )
                     logs = {
-                        "step_loss_gen": gen_loss.item(),
+                        "step_loss_gen": effective_gen_loss,
                         "step_loss_vote": vote_loss.item(),
-                        "step_loss_total": total_loss.item(),
+                        "step_loss_total": total_loss.item() if total_loss.requires_grad else effective_gen_loss + vote_loss.item(),
                         "lr_ve": lr[0],
                         "lr_proj": lr[1],
                         "lr_showo": lr[2],
@@ -780,13 +773,16 @@ def main():
                         logs["flow_grpo_clip_fraction"] = flow_grpo_metrics.get('clip_fraction', 0)
                         logs["flow_grpo_mean_ratio"] = flow_grpo_metrics.get('mean_ratio', 1)
                         logs["flow_grpo_approx_kl"] = flow_grpo_metrics.get('approx_kl', 0)
-                        logs["flow_grpo_mean_logprob"] = flow_grpo_metrics.get('mean_logprob', 0)
+                        logs["flow_grpo_policy_loss"] = flow_grpo_metrics.get('policy_loss', 0)
+                        logs["flow_grpo_kl_loss"] = flow_grpo_metrics.get('kl_loss', 0)
+                        logs["flow_grpo_mean_reward"] = flow_grpo_metrics.get('mean_reward', 0)
+                        logs["flow_grpo_num_sde_steps"] = flow_grpo_metrics.get('num_sde_steps', 0)
 
                     accelerator.log(logs, step=global_step + 1)
                     logger.info(
                         f"Epoch: {epoch} "
                         f"Step: {global_step + 1} "
-                        f"Loss_Gen: {gen_loss.item():.4f} "
+                        f"Loss_Gen: {effective_gen_loss:.4f} "
                         f"Loss_Vote: {vote_loss.item():.4f} "
                         f"SpyRate: {spy_rate:.2%} "
                         f"{phase_info} "

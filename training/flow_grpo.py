@@ -2,25 +2,25 @@
 Flow-GRPO: Group Relative Policy Optimization for Flow Matching.
 
 Implements the ODE→SDE conversion from Flow-GRPO (arXiv 2505.05470) to enable
-proper policy gradient optimization on Show-o2's continuous flow matching head.
+proper policy gradient optimization on continuous flow matching models.
 
-Key ideas:
-1. Convert deterministic ODE (dx = v_θ dt) to stochastic SDE that preserves
-   marginal distributions but enables log-probability computation.
-2. The converted SDE transition π_θ(x_{t-1}|x_t, c) is an isotropic Gaussian,
-   allowing closed-form importance ratios for PPO-clip.
-3. Flow-GRPO-Fast: train on only 1-2 randomly selected SDE steps per trajectory
-   for 5-10x speedup.
+Architecture follows the Bagel Flow-GRPO reference implementation:
+1. Hybrid ODE/SDE trajectory: most steps are deterministic ODE, only a random
+   contiguous window uses stochastic SDE to create trainable "actions".
+2. Per-timestep backward: each SDE step gets its own gradient update for
+   memory efficiency (no need to store all intermediate activations).
+3. Each generated image gets its own real reward (not borrowed from ODE).
 
 Reference: Flow-GRPO (arXiv 2505.05470, NeurIPS 2025)
 """
 
 import math
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Callable
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -29,16 +29,15 @@ class FlowGRPOConfig:
     # SDE noise schedule: σ_t = a * sqrt(t / (1-t))
     sde_noise_scale: float = 0.7
     # GRPO hyperparameters
-    group_size: int = 4          # G: number of images per prompt
+    group_size: int = 4          # G: number of games per training step
     epsilon: float = 0.2         # PPO clip parameter
     beta: float = 0.01           # KL penalty coefficient
     # Denoising steps
-    num_train_steps: int = 10    # T: denoising steps for training (vs 50 for inference)
+    num_train_steps: int = 10    # T: total denoising steps during training
     num_inference_steps: int = 50
-    # Flow-GRPO-Fast: use only a subset of SDE steps
-    fast_mode: bool = False
-    sde_window_size: int = 2     # number of SDE steps to train on in fast mode
-    sde_window_range: Tuple[float, float] = (0.1, 0.9)  # t range for SDE window
+    # SDE window: contiguous window of SDE steps within the trajectory
+    sde_window_size: int = 2     # number of SDE steps (rest are ODE)
+    sde_window_range: Tuple[int, int] = (0, 5)  # step index range for window start
     # Time shifting (from Show-o2's transport)
     do_shift: bool = True
     time_shifting_factor: float = 3.0
@@ -47,8 +46,10 @@ class FlowGRPOConfig:
 class FlowGRPO(nn.Module):
     """Flow-GRPO: GRPO for continuous flow matching models.
 
-    Converts Show-o2's deterministic ODE sampling into a stochastic SDE,
-    computes per-step log probabilities, and applies PPO-clip GRPO loss.
+    Follows the Bagel reference implementation pattern:
+    - Hybrid ODE/SDE trajectory generation
+    - Per-timestep GRPO loss computation
+    - Model-agnostic interface via velocity_fn callable
     """
 
     def __init__(self, config: FlowGRPOConfig):
@@ -59,15 +60,7 @@ class FlowGRPO(nn.Module):
     # ==================== NOISE SCHEDULE ====================
 
     def sigma_t(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute SDE noise schedule: σ_t = a * sqrt(t / (1-t)).
-
-        Args:
-            t: [B] or scalar, timestep in [eps, 1-eps].
-
-        Returns:
-            σ_t values, same shape as t.
-        """
-        # Clamp to avoid division by zero
+        """σ_t = a * sqrt(t / (1-t))."""
         t_clamped = t.clamp(min=1e-4, max=1.0 - 1e-4)
         return self.a * torch.sqrt(t_clamped / (1.0 - t_clamped))
 
@@ -80,555 +73,259 @@ class FlowGRPO(nn.Module):
 
     def sde_drift(self, x_t: torch.Tensor, t: torch.Tensor,
                   v_theta: torch.Tensor) -> torch.Tensor:
-        """Compute the drift term of the converted SDE.
-
-        The SDE is:
-            dx_t = f(x_t, t) dt + σ_t dw
-        where:
-            f(x_t, t) = v_θ(x_t, t) + (σ_t² / (2t)) * (x_t + (1-t) * v_θ(x_t, t))
-
-        Args:
-            x_t: [B, C, H, W] current state.
-            t: [B] timestep (scalar broadcast or per-sample).
-            v_theta: [B, C, H, W] velocity prediction from model.
-
-        Returns:
-            [B, C, H, W] SDE drift.
-        """
-        t_expanded = t.view(-1, 1, 1, 1)  # [B, 1, 1, 1]
+        """Compute SDE drift: f(x,t) = v_θ + σ²/(2t)·(x + (1-t)·v_θ)."""
+        t_expanded = t.view(-1, 1, 1, 1)
         sigma_sq = self.sigma_t_sq(t).view(-1, 1, 1, 1)
-
-        # Extra drift from SDE conversion
         correction = (sigma_sq / (2.0 * t_expanded.clamp(min=1e-4))) * (
             x_t + (1.0 - t_expanded) * v_theta
         )
-
         return v_theta + correction
 
     def sde_step(self, x_t: torch.Tensor, t: torch.Tensor,
                  dt: float, v_theta: torch.Tensor,
-                 noise: Optional[torch.Tensor] = None
+                 noise: Optional[torch.Tensor] = None,
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Euler-Maruyama SDE step.
-
-        x_{t+dt} = x_t + f(x_t, t) * dt + σ_t * sqrt(dt) * z
-        where z ~ N(0, I).
-
-        Args:
-            x_t: [B, C, H, W] current state.
-            t: [B] current timestep.
-            dt: scalar step size.
-            v_theta: [B, C, H, W] velocity prediction.
-            noise: [B, C, H, W] optional pre-sampled noise.
-
-        Returns:
-            (x_{t+dt}, noise_used): next state and the noise used.
-        """
+        """Euler-Maruyama SDE step: x_{t+dt} = x_t + f·dt + σ·√dt·z."""
         if noise is None:
             noise = torch.randn_like(x_t)
-
         drift = self.sde_drift(x_t, t, v_theta)
         sigma = self.sigma_t(t).view(-1, 1, 1, 1)
-
         x_next = x_t + drift * dt + sigma * math.sqrt(abs(dt)) * noise
-
         return x_next, noise
+
+    def ode_step(self, x_t: torch.Tensor, dt: float,
+                 v_theta: torch.Tensor) -> torch.Tensor:
+        """Deterministic ODE (Euler) step: x_{t+dt} = x_t + v_θ·dt."""
+        return x_t + v_theta * dt
 
     # ==================== LOG PROBABILITY ====================
 
     def compute_step_logprob(self, x_t: torch.Tensor, x_next: torch.Tensor,
                              t: torch.Tensor, dt: float,
                              v_theta: torch.Tensor) -> torch.Tensor:
-        """Compute log π_θ(x_{t+dt} | x_t, c) for one SDE step.
+        """Compute log π_θ(x_{t+dt} | x_t) for one SDE step.
 
-        Since π_θ(x_{t+dt} | x_t) is Gaussian:
-            mean = x_t + f(x_t, t) * dt
-            std = σ_t * sqrt(dt)
-
-        log p = -0.5 * ||x_{t+dt} - mean||² / var - 0.5 * D * log(2π * var)
-
-        Args:
-            x_t: [B, C, H, W] current state.
-            x_next: [B, C, H, W] next state.
-            t: [B] current timestep.
-            dt: scalar step size.
-            v_theta: [B, C, H, W] velocity prediction at (x_t, t).
+        Following Bagel: average over spatial dims, drop normalization constant
+        (it cancels in the importance ratio).
 
         Returns:
-            [B] log probability of the transition.
+            [B] per-sample log probability (averaged over dimensions).
         """
         drift = self.sde_drift(x_t, t, v_theta)
         sigma = self.sigma_t(t).view(-1, 1, 1, 1)
 
         mean = x_t + drift * dt
-        var = (sigma ** 2) * abs(dt)  # [B, 1, 1, 1]
+        std = sigma * math.sqrt(abs(dt))  # [B, 1, 1, 1]
 
-        # Per-element log prob
         diff = x_next - mean
-        D = diff[0].numel()  # total dimensions per sample
-        log_prob = -0.5 * (diff ** 2 / var.clamp(min=1e-8)).sum(dim=[1, 2, 3])
-        log_prob = log_prob - 0.5 * D * torch.log(2 * math.pi * var.squeeze().clamp(min=1e-8))
+        # Average over spatial dims (like Bagel), not sum
+        # Normalization constant cancels in importance ratio
+        log_prob = -0.5 * (diff ** 2 / std.clamp(min=1e-8) ** 2).mean(dim=[1, 2, 3])
 
         return log_prob  # [B]
 
-    def compute_step_kl(self, t: torch.Tensor, dt: float,
+    def compute_step_kl(self, x_t: torch.Tensor, t: torch.Tensor, dt: float,
                         v_theta: torch.Tensor,
                         v_ref: torch.Tensor) -> torch.Tensor:
-        """Compute per-step KL divergence D_KL(π_θ || π_ref).
+        """Compute per-step KL divergence (like Bagel's KL penalty).
 
-        D_KL = (dt/2) * ((σ_t(1-t))/(2t) + 1/σ_t)² * ||v_θ - v_ref||²
-
-        Args:
-            t: [B] current timestep.
-            dt: scalar step size.
-            v_theta: [B, C, H, W] current policy velocity.
-            v_ref: [B, C, H, W] reference policy velocity.
+        KL = ||mean_θ - mean_ref||² / (2·var)
 
         Returns:
             [B] per-step KL divergence.
         """
-        t_expanded = t.view(-1, 1, 1, 1)
         sigma = self.sigma_t(t).view(-1, 1, 1, 1)
+        var = (sigma ** 2) * abs(dt)  # [B, 1, 1, 1]
 
-        # KL coefficient
-        coeff = (sigma * (1.0 - t_expanded)) / (2.0 * t_expanded.clamp(min=1e-4)) + 1.0 / sigma.clamp(min=1e-8)
+        # Compute mean difference
+        drift_theta = self.sde_drift(x_t, t, v_theta)
+        drift_ref = self.sde_drift(x_t, t, v_ref)
+        mean_diff = (drift_theta - drift_ref) * dt
 
-        velocity_diff_sq = (v_theta - v_ref) ** 2
-        kl = (abs(dt) / 2.0) * (coeff ** 2) * velocity_diff_sq
+        kl = (mean_diff ** 2 / (2.0 * var.clamp(min=1e-8))).mean(dim=[1, 2, 3])
+        return kl  # [B]
 
-        return kl.sum(dim=[1, 2, 3])  # [B]
+    # ==================== TIMESTEP SCHEDULE ====================
 
-    # ==================== SDE TRAJECTORY GENERATION ====================
-
-    def generate_sde_trajectory(
-        self,
-        model_fn,
-        z: torch.Tensor,
-        num_steps: int,
-        model_kwargs: Optional[dict] = None,
-    ) -> Dict[str, List[torch.Tensor]]:
-        """Generate a complete SDE trajectory with stored states and noise.
-
-        This is used during rollout to generate images while recording
-        all intermediate states needed for log-prob computation.
-
-        Args:
-            model_fn: Callable (x_t, t) -> v_theta. The model's velocity prediction.
-            z: [B, C, H, W] initial noise x_0 ~ N(0, I).
-            num_steps: Number of denoising steps.
-            model_kwargs: Additional kwargs passed to model_fn.
+    def make_timestep_schedule(self, num_steps: int,
+                               device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Create timestep schedule with optional time shifting.
 
         Returns:
-            Dict with:
-                'states': List of [B, C, H, W] states at each timestep (len = num_steps + 1)
-                'noises': List of [B, C, H, W] noise used at each step (len = num_steps)
-                'velocities': List of [B, C, H, W] velocity predictions (len = num_steps)
-                'timesteps': [num_steps] tensor of timestep values
-                'final': [B, C, H, W] final denoised image
+            (timesteps [num_steps+1], dt_values [num_steps])
         """
-        if model_kwargs is None:
-            model_kwargs = {}
-
-        device = z.device
-        B = z.shape[0]
-
-        # Create timestep schedule: t goes from 0 to 1
         timesteps = torch.linspace(0, 1, num_steps + 1, device=device)
-
-        # Apply time shifting if configured
         if self.config.do_shift and self.config.time_shifting_factor:
             factor = self.config.time_shifting_factor
             timesteps = timesteps / (timesteps + factor - factor * timesteps)
+        dt_values = timesteps[1:] - timesteps[:-1]
+        return timesteps, dt_values
 
-        dt_values = timesteps[1:] - timesteps[:-1]  # [num_steps]
+    def select_sde_window(self, num_steps: int) -> Tuple[int, int]:
+        """Select contiguous SDE window (like Bagel's sde_window).
 
-        states = [z]
-        noises = []
-        velocities = []
+        Returns:
+            (sde_begin, sde_end) step indices. Steps in [begin, end) use SDE.
+        """
+        ws = min(self.config.sde_window_size, num_steps)
+        lo, hi = self.config.sde_window_range
+        lo = max(0, min(lo, num_steps - ws))
+        hi = max(lo, min(hi, num_steps - ws))
+        begin = random.randint(lo, hi) if hi > lo else lo
+        end = begin + ws
+        return begin, end
 
+    # ==================== HYBRID ODE/SDE TRAJECTORY ====================
+
+    @torch.no_grad()
+    def generate_trajectory(
+        self,
+        model_fn: Callable,
+        z: torch.Tensor,
+        num_steps: int,
+    ) -> Dict[str, any]:
+        """Generate hybrid ODE/SDE trajectory (like Bagel).
+
+        Most steps are deterministic ODE. A random contiguous window uses
+        stochastic SDE. Only SDE window data is recorded for training.
+
+        Args:
+            model_fn: (x_t, t) -> v_theta velocity prediction.
+            z: [B, C, H, W] initial noise.
+            num_steps: Total denoising steps.
+
+        Returns:
+            Dict with:
+                'final': [B, C, H, W] final denoised latent.
+                'sde_steps': list of dicts, one per SDE window step, each with:
+                    'x_t': [B,C,H,W] state before step (detached)
+                    'x_next': [B,C,H,W] state after step (detached)
+                    'old_logprob': [B] log prob under sampling policy (detached)
+                    't': scalar timestep
+                    'dt': scalar step size
+                'sde_window': (begin, end) step indices
+        """
+        device = z.device
+        B = z.shape[0]
+
+        timesteps, dt_values = self.make_timestep_schedule(num_steps, device)
+        sde_begin, sde_end = self.select_sde_window(num_steps)
+
+        sde_steps = []
         x_t = z
+
         for i in range(num_steps):
             t_i = timesteps[i].expand(B)
             dt_i = dt_values[i].item()
 
-            # Get velocity prediction
-            v_theta = model_fn(x_t, t_i, **model_kwargs)
-            velocities.append(v_theta.detach())
+            v_theta = model_fn(x_t, t_i)
 
-            # SDE step
-            noise_i = torch.randn_like(x_t)
-            x_next, _ = self.sde_step(x_t, t_i, dt_i, v_theta, noise=noise_i)
+            if sde_begin <= i < sde_end:
+                # SDE step: stochastic, record for training
+                noise = torch.randn_like(x_t)
+                x_next, _ = self.sde_step(x_t, t_i, dt_i, v_theta, noise=noise)
 
-            states.append(x_next.detach())
-            noises.append(noise_i)
+                old_lp = self.compute_step_logprob(
+                    x_t, x_next, t_i, dt_i, v_theta
+                )
+
+                sde_steps.append({
+                    'x_t': x_t.detach(),
+                    'x_next': x_next.detach(),
+                    'old_logprob': old_lp.detach(),
+                    't': timesteps[i].item(),
+                    'dt': dt_i,
+                })
+            else:
+                # ODE step: deterministic
+                x_next = self.ode_step(x_t, dt_i, v_theta)
+
             x_t = x_next.detach()
 
         return {
-            'states': states,
-            'noises': noises,
-            'velocities': velocities,
-            'timesteps': timesteps,
-            'final': states[-1],
+            'final': x_t,
+            'sde_steps': sde_steps,
+            'sde_window': (sde_begin, sde_end),
         }
 
-    # ==================== LOG PROB OVER TRAJECTORY ====================
+    # ==================== PER-STEP GRPO LOSS ====================
 
-    def compute_trajectory_logprob(
+    def compute_per_step_loss(
         self,
-        model_fn,
-        trajectory: Dict[str, List[torch.Tensor]],
-        model_kwargs: Optional[dict] = None,
-        step_indices: Optional[List[int]] = None,
-    ) -> torch.Tensor:
-        """Compute total log probability over a trajectory (or subset of steps).
-
-        Args:
-            model_fn: Callable (x_t, t) -> v_theta.
-            trajectory: Output from generate_sde_trajectory().
-            model_kwargs: Additional kwargs for model_fn.
-            step_indices: If given, only compute log prob for these steps
-                         (for Flow-GRPO-Fast). If None, compute all steps.
-
-        Returns:
-            [B] total log probability summed over selected steps.
-        """
-        if model_kwargs is None:
-            model_kwargs = {}
-
-        states = trajectory['states']
-        timesteps = trajectory['timesteps']
-        dt_values = timesteps[1:] - timesteps[:-1]
-
-        num_steps = len(states) - 1
-        if step_indices is None:
-            step_indices = list(range(num_steps))
-
-        B = states[0].shape[0]
-        total_logprob = torch.zeros(B, device=states[0].device)
-
-        for i in step_indices:
-            x_t = states[i]
-            x_next = states[i + 1]
-            t_i = timesteps[i].expand(B)
-            dt_i = dt_values[i].item()
-
-            # Recompute velocity (with gradient)
-            v_theta = model_fn(x_t, t_i, **model_kwargs)
-            step_lp = self.compute_step_logprob(x_t, x_next, t_i, dt_i, v_theta)
-            total_logprob = total_logprob + step_lp
-
-        return total_logprob
-
-    def compute_trajectory_kl(
-        self,
-        model_fn,
-        ref_model_fn,
-        trajectory: Dict[str, List[torch.Tensor]],
-        model_kwargs: Optional[dict] = None,
-        step_indices: Optional[List[int]] = None,
-    ) -> torch.Tensor:
-        """Compute total KL divergence over trajectory between current and ref policy.
-
-        Args:
-            model_fn: Current policy velocity prediction.
-            ref_model_fn: Reference policy velocity prediction.
-            trajectory: Output from generate_sde_trajectory().
-            model_kwargs: Additional kwargs for model functions.
-            step_indices: Subset of steps for Fast mode.
-
-        Returns:
-            [B] total KL divergence.
-        """
-        if model_kwargs is None:
-            model_kwargs = {}
-
-        states = trajectory['states']
-        timesteps = trajectory['timesteps']
-        dt_values = timesteps[1:] - timesteps[:-1]
-
-        num_steps = len(states) - 1
-        if step_indices is None:
-            step_indices = list(range(num_steps))
-
-        B = states[0].shape[0]
-        total_kl = torch.zeros(B, device=states[0].device)
-
-        for i in step_indices:
-            x_t = states[i]
-            t_i = timesteps[i].expand(B)
-            dt_i = dt_values[i].item()
-
-            v_theta = model_fn(x_t, t_i, **model_kwargs)
-            with torch.no_grad():
-                v_ref = ref_model_fn(x_t, t_i, **model_kwargs)
-
-            step_kl = self.compute_step_kl(t_i, dt_i, v_theta, v_ref)
-            total_kl = total_kl + step_kl
-
-        return total_kl
-
-    # ==================== GRPO LOSS ====================
-
-    def select_fast_steps(self, num_steps: int,
-                          device: torch.device) -> List[int]:
-        """Select random SDE step indices for Flow-GRPO-Fast.
-
-        Args:
-            num_steps: Total number of denoising steps.
-            device: Device for random number generation.
-
-        Returns:
-            List of step indices to train on.
-        """
-        t_min, t_max = self.config.sde_window_range
-        # Map t range to step indices
-        step_min = max(1, int(t_min * num_steps))
-        step_max = min(num_steps - 1, int(t_max * num_steps))
-
-        if step_max <= step_min:
-            return [step_min]
-
-        # Randomly select sde_window_size steps within the range
-        n_select = min(self.config.sde_window_size, step_max - step_min)
-        perm = torch.randperm(step_max - step_min, device=device)[:n_select]
-        indices = (perm + step_min).sort().values.tolist()
-
-        return indices
-
-    def compute_grpo_loss(
-        self,
-        current_logprobs: torch.Tensor,
-        old_logprobs: torch.Tensor,
-        advantages: torch.Tensor,
-        kl_values: Optional[torch.Tensor] = None,
+        model_fn: Callable,
+        sde_step_data: Dict,
+        advantage: torch.Tensor,
+        ref_model_fn: Optional[Callable] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Compute the Flow-GRPO loss.
-
-        J = (1/G) Σᵢ [min(rᵢ·Âᵢ, clip(rᵢ, 1-ε, 1+ε)·Âᵢ) - β·D_KL]
-
-        Note: advantage is identical across all timesteps for a given image
-        (terminal reward only, normalized within the group).
+        """Compute GRPO loss for a single SDE step (like Bagel per-timestep backward).
 
         Args:
-            current_logprobs: [G] total log prob from current policy.
-            old_logprobs: [G] total log prob from behavior (old) policy.
-            advantages: [G] group-relative advantages.
-            kl_values: [G] optional KL divergence values.
+            model_fn: (x_t, t) -> v_theta, current policy (with gradient).
+            sde_step_data: One element from trajectory['sde_steps'].
+            advantage: [B] advantage value for this sample.
+            ref_model_fn: Optional reference model for KL penalty.
 
         Returns:
-            Dict with 'loss', 'policy_loss', 'kl_loss', 'metrics'.
+            Dict with 'loss', 'metrics'.
         """
-        # Importance ratio (in log space for stability, then exponentiate)
-        log_ratio = current_logprobs - old_logprobs
-        # Clamp for numerical stability
-        log_ratio = log_ratio.clamp(min=-10.0, max=10.0)
+        x_t = sde_step_data['x_t']        # detached
+        x_next = sde_step_data['x_next']  # detached
+        old_lp = sde_step_data['old_logprob']  # detached
+        device = x_t.device
+        B = x_t.shape[0]
+
+        t_val = sde_step_data['t']
+        dt_val = sde_step_data['dt']
+        t_tensor = torch.full((B,), t_val, device=device)
+
+        # Recompute velocity with gradient
+        v_theta = model_fn(x_t, t_tensor)
+        new_lp = self.compute_step_logprob(x_t, x_next, t_tensor, dt_val, v_theta)
+
+        # PPO-clip importance ratio
+        log_ratio = (new_lp - old_lp).clamp(-10.0, 10.0)
         ratio = torch.exp(log_ratio)
 
-        # PPO-clip
-        clipped_ratio = ratio.clamp(1.0 - self.config.epsilon,
-                                    1.0 + self.config.epsilon)
+        clipped_ratio = ratio.clamp(
+            1.0 - self.config.epsilon, 1.0 + self.config.epsilon
+        )
 
-        surr1 = ratio * advantages
-        surr2 = clipped_ratio * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
+        # Pessimistic bound (like Bagel: max of unclipped/clipped negative loss)
+        surr1 = -advantage * ratio
+        surr2 = -advantage * clipped_ratio
+        policy_loss = torch.max(surr1, surr2).mean()
 
         # KL penalty
-        kl_loss = torch.tensor(0.0, device=current_logprobs.device)
-        if self.config.beta > 0 and kl_values is not None:
-            kl_loss = self.config.beta * kl_values.mean()
+        kl_loss = torch.tensor(0.0, device=device)
+        if ref_model_fn is not None and self.config.beta > 0:
+            with torch.no_grad():
+                v_ref = ref_model_fn(x_t, t_tensor)
+            kl = self.compute_step_kl(x_t, t_tensor, dt_val, v_theta, v_ref)
+            kl_loss = self.config.beta * kl.mean()
 
         total_loss = policy_loss + kl_loss
 
-        # Metrics
         with torch.no_grad():
-            clip_fraction = ((ratio - 1.0).abs() > self.config.epsilon).float().mean()
-            approx_kl = (log_ratio ** 2).mean() * 0.5  # approximate KL from ratio
+            clip_frac = ((ratio - 1.0).abs() > self.config.epsilon).float().mean()
 
         return {
             'loss': total_loss,
-            'policy_loss': policy_loss.detach(),
-            'kl_loss': kl_loss.detach(),
             'metrics': {
-                'clip_fraction': clip_fraction.item(),
+                'clip_fraction': clip_frac.item(),
                 'mean_ratio': ratio.mean().item(),
-                'mean_advantage': advantages.mean().item(),
-                'std_advantage': advantages.std().item() if advantages.numel() > 1 else 0.0,
-                'approx_kl': approx_kl.item(),
-                'mean_logprob': current_logprobs.mean().item(),
-            }
+                'approx_kl': (log_ratio ** 2).mean().item() * 0.5,
+                'policy_loss': policy_loss.item(),
+                'kl_loss': kl_loss.item(),
+            },
         }
+
+    # ==================== ADVANTAGE COMPUTATION ====================
 
     @staticmethod
     def compute_advantages(rewards: torch.Tensor) -> torch.Tensor:
-        """Compute group-relative advantages from terminal rewards.
-
-        Â_i = (R_i - mean(R)) / std(R)
-
-        The advantage is identical across all timesteps for a given image
-        (terminal reward only).
-
-        Args:
-            rewards: [G] reward values for each generated image.
-
-        Returns:
-            [G] normalized advantages.
-        """
+        """Group-relative advantages: Â = (R - mean) / std."""
         if rewards.numel() <= 1:
             return torch.zeros_like(rewards)
-
         mean_r = rewards.mean()
         std_r = rewards.std().clamp(min=1e-8)
         return (rewards - mean_r) / std_r
-
-
-class FlowGRPOTrainer:
-    """High-level trainer that orchestrates Flow-GRPO training on Show-o2.
-
-    Manages the full pipeline:
-    1. Generate G images per prompt using SDE sampling
-    2. Score images with reward model
-    3. Compute advantages
-    4. Recompute log probs with gradient and apply GRPO loss
-    """
-
-    def __init__(self, flow_grpo: FlowGRPO, config: FlowGRPOConfig):
-        self.flow_grpo = flow_grpo
-        self.config = config
-
-    def train_step(
-        self,
-        model_fn,
-        ref_model_fn,
-        prompts: List[str],
-        reward_fn,
-        prepare_input_fn,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Dict[str, torch.Tensor]:
-        """Execute one Flow-GRPO training step.
-
-        Args:
-            model_fn: Callable (x_t, t, **kwargs) -> v_theta, current policy.
-            ref_model_fn: Callable for reference policy (or None to skip KL).
-            prompts: List of text prompts for this batch.
-            reward_fn: Callable (images: List[PIL.Image]) -> [G] rewards.
-            prepare_input_fn: Callable (prompts) -> (z_init, model_kwargs)
-                             that prepares the initial noise and model inputs.
-            device: Training device.
-            dtype: Training dtype.
-
-        Returns:
-            Dict with 'loss', 'rewards', 'metrics'.
-        """
-        G = self.config.group_size
-        T = self.config.num_train_steps
-
-        # ---- Phase 1: Generate G trajectories (no_grad) ----
-        all_trajectories = []
-        all_old_logprobs = []
-        all_rewards = []
-
-        for prompt in prompts:
-            prompt_trajectories = []
-            prompt_old_lps = []
-
-            for g in range(G):
-                z_init, model_kwargs = prepare_input_fn([prompt])
-                z_init = z_init.to(device).to(dtype)
-
-                with torch.no_grad():
-                    trajectory = self.flow_grpo.generate_sde_trajectory(
-                        model_fn, z_init, num_steps=T,
-                        model_kwargs=model_kwargs,
-                    )
-                    prompt_trajectories.append(trajectory)
-
-                    # Compute old log probs
-                    if self.config.fast_mode:
-                        step_indices = self.flow_grpo.select_fast_steps(T, device)
-                    else:
-                        step_indices = None
-
-                    old_lp = self.flow_grpo.compute_trajectory_logprob(
-                        model_fn, trajectory,
-                        model_kwargs=model_kwargs,
-                        step_indices=step_indices,
-                    )
-                    prompt_old_lps.append(old_lp)
-
-            all_trajectories.append(prompt_trajectories)
-            all_old_logprobs.append(torch.cat(prompt_old_lps, dim=0))  # [G]
-
-            # Score the final images
-            final_images = [traj['final'] for traj in prompt_trajectories]
-            rewards = reward_fn(final_images, prompt)
-            all_rewards.append(rewards)
-
-        # ---- Phase 2: Compute GRPO loss (with gradient) ----
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        all_metrics = {}
-
-        for p_idx, (prompt_trajs, old_lps, rewards) in enumerate(
-            zip(all_trajectories, all_old_logprobs, all_rewards)
-        ):
-            rewards_t = rewards.to(device).float()
-            advantages = FlowGRPO.compute_advantages(rewards_t)
-
-            # Recompute log probs with gradient
-            current_lps = []
-            kl_values = []
-
-            for g, traj in enumerate(prompt_trajs):
-                _, model_kwargs = prepare_input_fn([prompts[p_idx]])
-
-                if self.config.fast_mode:
-                    step_indices = self.flow_grpo.select_fast_steps(T, device)
-                else:
-                    step_indices = None
-
-                cur_lp = self.flow_grpo.compute_trajectory_logprob(
-                    model_fn, traj,
-                    model_kwargs=model_kwargs,
-                    step_indices=step_indices,
-                )
-                current_lps.append(cur_lp)
-
-                # KL divergence
-                if ref_model_fn is not None and self.config.beta > 0:
-                    kl = self.flow_grpo.compute_trajectory_kl(
-                        model_fn, ref_model_fn, traj,
-                        model_kwargs=model_kwargs,
-                        step_indices=step_indices,
-                    )
-                    kl_values.append(kl)
-
-            current_logprobs = torch.cat(current_lps, dim=0)  # [G]
-            kl_tensor = torch.cat(kl_values, dim=0) if kl_values else None
-
-            grpo_result = self.flow_grpo.compute_grpo_loss(
-                current_logprobs, old_lps.detach(),
-                advantages, kl_tensor,
-            )
-
-            total_loss = total_loss + grpo_result['loss']
-
-            # Accumulate metrics
-            for k, v in grpo_result['metrics'].items():
-                if k not in all_metrics:
-                    all_metrics[k] = []
-                all_metrics[k].append(v)
-
-        # Average over prompts
-        total_loss = total_loss / len(prompts)
-
-        # Average metrics
-        avg_metrics = {k: sum(v) / len(v) for k, v in all_metrics.items()}
-        avg_metrics['mean_reward'] = torch.cat(
-            [r.float() for r in all_rewards]
-        ).mean().item()
-
-        return {
-            'loss': total_loss,
-            'rewards': all_rewards,
-            'metrics': avg_metrics,
-        }

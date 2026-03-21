@@ -87,12 +87,10 @@ training:
   flow_grpo_beta: 0.01
   flow_grpo_train_steps: 10
 
-  # Flow-GRPO-Fast: only 1-2 SDE steps per trajectory
-  # Generates full ODE trajectory, injects noise at random intermediate step,
-  # trains on that single stochastic step. 5-10x faster than full Flow-GRPO.
-  flow_grpo_fast_mode: True
+  # SDE window: contiguous window of SDE steps within the hybrid ODE/SDE trajectory
+  # Smaller window = fewer trainable steps = faster training (5-10x)
   sde_window_size: 2
-  sde_window_range: [0.1, 0.9]
+  sde_window_range: [0, 5]      # [lo, hi] step index range for window start
 
 optimizer:
   name: adamw
