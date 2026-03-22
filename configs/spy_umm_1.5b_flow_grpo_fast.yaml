@@ -85,12 +85,12 @@ training:
   sde_noise_scale: 0.7
   flow_grpo_group_size: 4
   flow_grpo_beta: 0.01
-  flow_grpo_train_steps: 10
+  flow_grpo_train_steps: 20
 
   # SDE window: contiguous window of SDE steps within the hybrid ODE/SDE trajectory
   # Smaller window = fewer trainable steps = faster training (5-10x)
   sde_window_size: 2
-  sde_window_range: [0, 5]      # [lo, hi] step index range for window start
+  sde_window_range: [0, -1]     # [lo, hi]; -1 = num_steps//2 (Bagel default: first half)
 
 optimizer:
   name: adamw

@@ -393,10 +393,13 @@ class Showo2SpyWrapper(nn.Module):
                          question: str) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """Build input embeddings and attention mask for MMU mode.
 
-        Mirrors inference_mmu.py lines 126-159.
+        Supports variable-length image embeddings (e.g. concatenated
+        multi-image embeddings for grid voting).
 
         Args:
             image_embeds: [1, L, hidden_size] fused image embeddings.
+                          L can be num_mmu_tokens (single image) or
+                          N * num_mmu_tokens (multi-image grid).
             question: Text question/prompt.
 
         Returns:
@@ -406,6 +409,7 @@ class Showo2SpyWrapper(nn.Module):
 
         device = self.device
         dtype = self.dtype
+        num_img_tokens = image_embeds.shape[1]  # actual image token count
 
         input_ids = self.tokenizer(question, add_special_tokens=False).input_ids
         text_tokens_a = torch.tensor(
@@ -418,8 +422,6 @@ class Showo2SpyWrapper(nn.Module):
         text_embeds_a = self.model.showo.model.embed_tokens(text_tokens_a)
         text_embeds_b = self.model.showo.model.embed_tokens(text_tokens_b)
 
-        # Build input_embeds with image embeddings inserted
-        # Matches inference_mmu.py lines 133-152
         if self.add_time_embeds:
             time_embeds = self.model.time_embed(
                 torch.Tensor([[1.0]]).to(device), text_embeds_a.dtype
@@ -427,29 +429,26 @@ class Showo2SpyWrapper(nn.Module):
             if hasattr(self.model, 'time_embed_proj'):
                 time_embeds = self.model.time_embed_proj(time_embeds)
             input_embeds = torch.cat([
-                text_embeds_a,             # [bos] + sys_prompt + role_a
+                text_embeds_a,
                 text_embeds_b[:, :1],      # [boi]
-                time_embeds,               # time embedding
-                image_embeds,              # image tokens
+                time_embeds,
+                image_embeds,              # [1, num_img_tokens, hidden]
                 text_embeds_b[:, 1:],      # [eoi] + question + role_b
             ], dim=1).to(dtype)
-            # modality_positions: offset = len(text_a) + 2 (boi + time_embed)
             modality_positions = torch.tensor(
-                [text_tokens_a.shape[1] + 2, self.num_mmu_tokens]
+                [text_tokens_a.shape[1] + 2, num_img_tokens]
             )[None, None, :].to(device)
         else:
             input_embeds = torch.cat([
                 text_embeds_a,
-                text_embeds_b[:, :1],      # [boi]
+                text_embeds_b[:, :1],
                 image_embeds,
-                text_embeds_b[:, 1:],      # [eoi] + question + role_b
+                text_embeds_b[:, 1:],
             ], dim=1).to(dtype)
             modality_positions = torch.tensor(
-                [text_tokens_a.shape[1] + 1, self.num_mmu_tokens]
+                [text_tokens_a.shape[1] + 1, num_img_tokens]
             )[None, None, :].to(device)
 
-        # Attention mask: inverted=True for understanding mode
-        # Matches inference_mmu.py lines 154-159
         attention_mask = omni_attn_mask_naive(
             B=input_embeds.size(0),
             LEN=input_embeds.size(1),
@@ -468,11 +467,8 @@ class Showo2SpyWrapper(nn.Module):
                    top_k: int = 50) -> str:
         """Generate vote text using Show-o2's understanding mode.
 
-        Uses the first image in the list for understanding context.
-        (Extending to multi-image voting can be done by creating a grid
-        image or concatenating image embeddings.)
-
-        Mirrors inference_mmu.py lines 161-169.
+        Like Vision-Zero: the voter sees ALL players' images as a labeled
+        grid, then decides which player is the spy.
 
         Args:
             image_latents_list: List of [1, C, H, W] latents for each player's image.
@@ -484,12 +480,43 @@ class Showo2SpyWrapper(nn.Module):
         Returns:
             Generated text response.
         """
-        # Use first image for now; multi-image support is a future extension
-        image_latents = image_latents_list[0]
+        if len(image_latents_list) == 1:
+            # Single image: use directly
+            image_latents = image_latents_list[0]
+        else:
+            # Multiple images: create a grid image (all players visible),
+            # then re-encode as a single image. This keeps the same token
+            # count as a single image while showing all players' work.
+            from utils import denorm
+            pil_images = []
+            for lat in image_latents_list:
+                img_tensor = self.vae.batch_decode(lat.unsqueeze(2)).squeeze(2)
+                img_np = denorm(img_tensor)
+                pil_images.append(Image.fromarray(img_np[0]))
+
+            # Build labeled grid
+            N = len(pil_images)
+            cols = min(N, 2)
+            rows = (N + cols - 1) // cols
+            cell_size = pil_images[0].size[0] // cols  # shrink to fit
+            grid_size = pil_images[0].size[0]  # same total size as single image
+            grid = Image.new('RGB', (grid_size, grid_size), (200, 200, 200))
+            for idx, img in enumerate(pil_images):
+                r, c = divmod(idx, cols)
+                x, y = c * cell_size, r * cell_size
+                grid.paste(img.resize((cell_size, cell_size)), (x, y))
+
+            # Re-encode grid as single latent (same shape as one image)
+            import torchvision.transforms as T
+            grid_tensor = T.ToTensor()(grid).unsqueeze(0).to(self.device)
+            grid_tensor = grid_tensor * 2.0 - 1.0
+            image_latents = self.vae.sample(
+                grid_tensor.unsqueeze(2).to(self.dtype)
+            ).squeeze(2)
+
         image_embeds = self._encode_image_for_mmu(image_latents)
         input_embeds, attention_mask, _ = self._build_mmu_input(image_embeds, question)
 
-        # Autoregressive generation: matches inference_mmu.py lines 161-165
         output_tokens = self.model.mmu_generate(
             input_embeds=input_embeds,
             attention_mask=attention_mask,
@@ -498,7 +525,6 @@ class Showo2SpyWrapper(nn.Module):
             eos_token=self.tokenizer.eos_token_id,
         )
 
-        # mmu_generate returns a list of token IDs
         output_tokens = torch.stack(output_tokens).squeeze()[None]
         text = self.tokenizer.batch_decode(output_tokens, skip_special_tokens=True)
         return text[0]
@@ -675,7 +701,7 @@ class Showo2SpyWrapper(nn.Module):
 
         velocity_fn = self.make_velocity_fn(**vfn_kwargs)
 
-        trajectory = flow_grpo.generate_sde_trajectory(
+        trajectory = flow_grpo.generate_trajectory(
             velocity_fn, z_init, num_steps=num_steps,
         )
 

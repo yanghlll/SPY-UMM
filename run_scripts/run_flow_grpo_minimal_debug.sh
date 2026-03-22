@@ -43,10 +43,11 @@ python train_spy_umm.py \
     training.flow_grpo_group_size=2 \
     training.flow_grpo_train_steps=4 \
     training.sde_window_size=1 \
-    training.sde_window_range="[0,2]" \
+    training.sde_window_range="[0,-1]" \
     training.flow_grpo_beta=0.0 \
+    training.num_inner_epochs=2 \
     training.gen_loss_coeff=1.0 \
     training.vote_loss_coeff=0.0 \
-    transport.num_inference_steps=4 \
-    transport.guidance_scale=0.0 \
+    transport.num_inference_steps=10 \
+    transport.guidance_scale=5.0 \
     2>&1 | tee output/flow-grpo-min-debug.log

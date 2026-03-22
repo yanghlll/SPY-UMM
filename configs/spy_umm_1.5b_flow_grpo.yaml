@@ -65,8 +65,8 @@ training:
   ntp_coeff: 0.2
   flow_coeff: 1.0
   num_generations: 4          # G for GRPO in voting phase
-  beta: 0.0                   # KL penalty for voting GRPO
-  epsilon: 0.2                # PPO clip for both voting and flow GRPO
+  clip_range: 0.2              # PPO clip range (Bagel uses 1e-5; 0.2 is standard PPO)
+  flow_grpo_beta: 0.0         # KL penalty (Bagel default: 0)
   gradient_accumulation_steps: 4
   batch_size: 1               # games per batch
   mixed_precision: "bf16"
@@ -93,18 +93,15 @@ training:
   # Paper recommends G=24 with 48 groups; we use 4 for memory efficiency
   flow_grpo_group_size: 4
 
-  # KL penalty coefficient for flow head
-  # Separate from voting GRPO beta to allow independent tuning
-  flow_grpo_beta: 0.01
-
-  # Number of SDE denoising steps for training
-  # Paper: T=10 gives 4x speedup vs T=40 with negligible reward loss
-  flow_grpo_train_steps: 10
+  # Number of total denoising steps for SDE trajectory (same as ODE inference)
+  # Bagel uses same num_steps for both ODE and SDE; fewer steps = faster but lower quality
+  flow_grpo_train_steps: 20     # Use same as transport.num_inference_steps or less
 
   # SDE window: contiguous window of SDE steps within the hybrid ODE/SDE trajectory
   # (like Bagel: most steps are ODE, only sde_window_size steps are stochastic SDE)
-  sde_window_size: 2            # Number of contiguous SDE steps
-  sde_window_range: [0, 5]      # [lo, hi] step index range for window start
+  sde_window_size: 3            # Number of contiguous SDE steps (Bagel uses 3)
+  sde_window_range: [0, -1]     # [lo, hi]; -1 = num_steps//2 (Bagel default: first half)
+  num_inner_epochs: 2           # Inner epochs per training step (Bagel-style; ratio deviates after epoch 0)
 
 optimizer:
   name: adamw

@@ -104,8 +104,16 @@ class SceneDescriptionGenerator:
         """Generate a natural language description of a single object."""
         return f"a {obj['size']} {obj['color']} {obj['material']} {obj['shape']}"
 
-    def _describe_scene(self, objects: List[Dict[str, str]], rng: random.Random) -> str:
-        """Generate a natural language description of the entire scene."""
+    def _describe_scene(self, objects: List[Dict[str, str]],
+                        style: str = 'list') -> str:
+        """Generate a natural language description of the entire scene.
+
+        Args:
+            objects: List of object dicts.
+            style: Description style ('list', 'narrative', 'structured').
+                   Must be the same for original and modified to avoid
+                   format leaking the spy's identity.
+        """
         if not objects:
             return "An empty scene."
 
@@ -120,9 +128,6 @@ class SceneDescriptionGenerator:
         # Build the full description
         if len(descriptions) == 1:
             return f"A scene with {descriptions[0]}."
-
-        # Randomly choose description style
-        style = rng.choice(['list', 'narrative', 'structured'])
 
         if style == 'list':
             items = ', '.join(descriptions[:-1]) + f', and {descriptions[-1]}'
@@ -162,12 +167,10 @@ class SceneDescriptionGenerator:
         # Create modified version
         modified_objects, modify_indices = self._modify_scene(rng, objects)
 
-        # Generate descriptions
-        original_desc = self._describe_scene(objects, rng)
-        # Use a separate rng for modified to get same style
-        rng_mod = random.Random(seed)
-        rng_mod.randint(0, 100)  # Advance state slightly
-        modified_desc = self._describe_scene(modified_objects, rng_mod)
+        # Pick style once, use same style for both (prevents format leak)
+        style = rng.choice(['list', 'narrative', 'structured'])
+        original_desc = self._describe_scene(objects, style=style)
+        modified_desc = self._describe_scene(modified_objects, style=style)
 
         # Build metadata about differences
         differences = []

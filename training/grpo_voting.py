@@ -83,8 +83,9 @@ class VotingGRPO:
         # KL penalty (optional)
         kl_loss = torch.tensor(0.0, device=current_logprobs.device)
         if self.beta > 0 and ref_logprobs is not None:
-            kl_div = (current_logprobs - ref_logprobs) * completion_mask
-            kl_per_sample = kl_div.sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1)
+            # KL ≈ E[(log π - log π_ref)²] / 2 (always non-negative)
+            kl_div = ((current_logprobs - ref_logprobs) ** 2) * completion_mask
+            kl_per_sample = kl_div.sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1) * 0.5
             kl_loss = self.beta * kl_per_sample.mean()
 
         total_loss = policy_loss + kl_loss
