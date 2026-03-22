@@ -118,14 +118,19 @@ class SpyGameDataGenerator:
 
     def format_generation_prompt_simple(self, game_data: Dict[str, Any],
                                         player_id: int) -> str:
-        """Simplified generation prompt without role information.
+        """Generation prompt for the spy game.
 
-        For training, we may want to not reveal the role to the generator,
-        and let the reward signal guide behavior.
+        Each player is told to generate a unique image from the description.
+        The prompt explicitly requires originality to prevent the model from
+        taking shortcuts (e.g. copying a template image for all players).
         """
         desc = game_data["player_descriptions"][player_id - 1]
         return (
-            f"A 3D rendered scene with geometric objects: {desc}"
+            f"You are Player {player_id} in a {game_data['num_players']}-player drawing game. "
+            f"Each player independently draws the same scene from their own perspective. "
+            f"Your drawing must be ORIGINAL — use your own unique composition, camera angle, "
+            f"and object arrangement. Do NOT copy or reproduce any existing image.\n\n"
+            f"Draw this scene accurately:\n{desc}"
         )
 
     def format_voting_prompt(self, game_data: Dict[str, Any],
