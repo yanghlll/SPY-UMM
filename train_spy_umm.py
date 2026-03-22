@@ -305,20 +305,29 @@ def main():
 
             for g in range(G):
                 with torch.no_grad():
-                    inputs = spy_wrapper.prepare_flow_grpo_inputs(
-                        prompts, guidance_scale=sde_guidance
-                    )
-                    vfn_kwargs = inputs['velocity_fn_kwargs']
-                    velocity_fn = spy_wrapper.make_velocity_fn(**vfn_kwargs)
+                    # Generate each player SEQUENTIALLY to save memory
+                    # (batching 4 players + CFG = 8x forward, OOM on H200)
+                    player_trajs = []
+                    player_vfn_kwargs = []
+                    player_latents = []
 
-                    traj = flow_grpo.generate_trajectory(
-                        velocity_fn, inputs['z_init'],
-                        num_steps=T_train, sde_window=sde_window,
-                    )
+                    for pid in range(num_players):
+                        inputs = spy_wrapper.prepare_flow_grpo_inputs(
+                            [prompts[pid]], guidance_scale=sde_guidance
+                        )
+                        vfn_kw = inputs['velocity_fn_kwargs']
+                        vel_fn = spy_wrapper.make_velocity_fn(**vfn_kw)
 
-                    # Voting: each player sees ALL images, votes with role-specific prompt
-                    sde_latents = traj['final']
-                    all_image_latents = [sde_latents[pid:pid+1] for pid in range(num_players)]
+                        ptraj = flow_grpo.generate_trajectory(
+                            vel_fn, inputs['z_init'],
+                            num_steps=T_train, sde_window=sde_window,
+                        )
+                        player_trajs.append(ptraj)
+                        player_vfn_kwargs.append(vfn_kw)
+                        player_latents.append(ptraj['final'])
+
+                    # Voting: each player sees ALL images
+                    all_image_latents = player_latents  # list of [1,C,H,W]
 
                     game_votes = []
                     for pid in range(1, num_players + 1):
@@ -339,8 +348,8 @@ def main():
                         spy_caught_count += 1
                     total_games_played += 1
 
-                all_game_trajs.append(traj)
-                all_game_vfn_kwargs.append(vfn_kwargs)
+                all_game_trajs.append(player_trajs)         # [G][num_players]
+                all_game_vfn_kwargs.append(player_vfn_kwargs)  # [G][num_players]
                 all_game_rewards.append(gen_rewards_g)
 
             # =============================================
@@ -354,48 +363,35 @@ def main():
             )
 
             # =============================================
-            # Phase 3: Batched per-timestep backward + inner epochs
+            # Phase 3: Per-player per-timestep backward + inner epochs
+            # Process each player sequentially to save memory.
             # =============================================
             grpo_metrics_accum = []
-            n_sde_window = len(all_game_trajs[0]['sde_steps'])
-
-            # Tile vfn_kwargs for G games
-            base_vfn = all_game_vfn_kwargs[0]
-            if G > 1:
-                tiled_kwargs = {}
-                for k, v in base_vfn.items():
-                    if isinstance(v, torch.Tensor):
-                        tiled_kwargs[k] = v.repeat(G, *([1] * (v.dim() - 1)))
-                    else:
-                        tiled_kwargs[k] = v
-            else:
-                tiled_kwargs = base_vfn
-
-            # Pre-stack SDE step data
-            batched_sde_steps = []
-            for step_idx in range(n_sde_window):
-                batched_sde_steps.append({
-                    'x_t': torch.cat([all_game_trajs[g]['sde_steps'][step_idx]['x_t']
-                                      for g in range(G)], dim=0),
-                    'x_next': torch.cat([all_game_trajs[g]['sde_steps'][step_idx]['x_next']
-                                         for g in range(G)], dim=0),
-                    'old_logprob': torch.cat([all_game_trajs[g]['sde_steps'][step_idx]['old_logprob']
-                                              for g in range(G)], dim=0),
-                    't': all_game_trajs[0]['sde_steps'][step_idx]['t'],
-                    'dt': all_game_trajs[0]['sde_steps'][step_idx]['dt'],
-                })
+            n_sde_window = len(all_game_trajs[0][0]['sde_steps'])
+            total_trajs = G * num_players  # total trajectories
 
             for inner_epoch in range(num_inner_epochs):
-                velocity_fn = spy_wrapper.make_velocity_fn(**tiled_kwargs)
+                adv_idx = 0
+                for g in range(G):
+                    for pid in range(num_players):
+                        ptraj = all_game_trajs[g][pid]
+                        vfn_kw = all_game_vfn_kwargs[g][pid]
+                        adv = all_advantages[adv_idx]
+                        adv_idx += 1
 
-                for step_idx in range(n_sde_window):
-                    step_result = flow_grpo.compute_per_step_loss(
-                        velocity_fn, batched_sde_steps[step_idx],
-                        all_advantages, ref_model_fn=None,
-                    )
-                    step_loss = step_result['loss'] * config.training.gen_loss_coeff
-                    accelerator.backward(step_loss / (num_inner_epochs * n_sde_window))
-                    grpo_metrics_accum.append(step_result['metrics'])
+                        vel_fn = spy_wrapper.make_velocity_fn(**vfn_kw)
+
+                        for sde_step_data in ptraj['sde_steps']:
+                            step_result = flow_grpo.compute_per_step_loss(
+                                vel_fn, sde_step_data,
+                                adv.unsqueeze(0),
+                                ref_model_fn=None,
+                            )
+                            step_loss = step_result['loss'] * config.training.gen_loss_coeff
+                            accelerator.backward(
+                                step_loss / (num_inner_epochs * n_sde_window * total_trajs)
+                            )
+                            grpo_metrics_accum.append(step_result['metrics'])
 
                 # Optimizer step per inner epoch
                 if accelerator.sync_gradients:
@@ -419,7 +415,9 @@ def main():
                 ) / len(grpo_metrics_accum)
                 flow_grpo_metrics['mean_reward'] = sum(flat_rewards) / len(flat_rewards)
 
-            generated_latents = all_game_trajs[0]['final']
+            generated_latents = torch.cat([
+                all_game_trajs[0][pid]['final'] for pid in range(num_players)
+            ], dim=0)
 
             # =============================================
             # Logging & Checkpointing

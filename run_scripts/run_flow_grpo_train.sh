@@ -23,8 +23,8 @@ cd /adialab/usr/shadabk/MedUMM/SPY-UMM
 echo "============================================"
 echo "  Flow-GRPO Training"
 echo "  GPUs: ${CUDA_VISIBLE_DEVICES} (${NUM_GPUS} cards)"
-echo "  Players: 4, Groups: 2, TrainSteps: 20"
-echo "  SDE window: 3 steps, CFG: 5.0"
+echo "  Players: 4, Groups: 2, T: 10, Window: 3"
+echo "  Inner epochs: 1, CFG: 4.0, noise: 1.3"
 echo "============================================"
 
 accelerate launch \
@@ -43,18 +43,18 @@ accelerate launch \
     game.num_objects_to_modify=1 \
     game.epoch_size=500 \
     training.max_train_steps=5000 \
-    training.gradient_accumulation_steps=2 \
-    training.phase_mode="generation" \
-    training.use_flow_grpo=True \
+    training.gradient_accumulation_steps=1 \
     training.flow_grpo_group_size=2 \
-    training.flow_grpo_train_steps=20 \
+    training.flow_grpo_train_steps=10 \
     training.sde_window_size=3 \
     training.sde_window_range="[0,-1]" \
-    training.sde_noise_scale=0.7 \
+    training.sde_noise_scale=1.3 \
+    training.clip_range=1e-5 \
     training.flow_grpo_beta=0.0 \
+    training.num_inner_epochs=1 \
     training.gen_loss_coeff=1.0 \
-    training.vote_loss_coeff=0.0 \
     training.max_grad_norm=1.0 \
-    transport.num_inference_steps=20 \
-    transport.guidance_scale=5.0 \
+    training.max_vote_tokens=64 \
+    transport.num_inference_steps=10 \
+    transport.guidance_scale=4.0 \
     2>&1 | tee output/flow-grpo-train.log
